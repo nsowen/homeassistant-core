@@ -12,6 +12,7 @@ PLATFORMS = [
     Platform.NUMBER,
     Platform.SELECT,
     Platform.SENSOR,
+    Platform.SWITCH,
     Platform.WATER_HEATER,
 ]
 
@@ -40,3 +41,13 @@ VICARE_KWH = "kilowattHour"
 VICARE_PERCENT = "percent"
 VICARE_W = "watt"
 VICARE_WH = "wattHour"
+
+CONF_CIRCULATION_BOOST_DURATION = "circulation_boost_duration"
+DEFAULT_CIRCULATION_BOOST_DURATION = 10  # minutes
+
+# Internal config-entry options used to persist boost state across restarts.
+# These are not user-configurable.
+CONF_BOOST_END_TIME = "_boost_end_time"
+CONF_BOOST_ORIGINAL_SCHEDULE = "_boost_original_schedule"
+
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]

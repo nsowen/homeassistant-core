@@ -21,6 +21,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
 
 from .const import DOMAIN, VIESSMANN_DEVELOPER_PORTAL
+from .types import ViCareConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class ViCareEntity(Entity):
         device_config: PyViCareDeviceConfig,
         device: PyViCareDevice,
         component: PyViCareHeatingDeviceComponent | None = None,
+        config_entry: ViCareConfigEntry | None = None,
     ) -> None:
         """Initialize the entity."""
         gateway_serial = device_config.getConfig().serial
@@ -97,3 +99,5 @@ class ViCareEntity(Entity):
                 )
         else:
             self._attr_device_info["serial_number"] = device_serial
+
+        self._config_entry = config_entry

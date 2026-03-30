@@ -21,10 +21,11 @@ from homeassistant.components.number import (
     NumberEntityDescription,
     NumberMode,
 )
-from homeassistant.const import EntityCategory, UnitOfTemperature
+from homeassistant.const import EntityCategory, UnitOfTemperature, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from .const import CONF_CIRCULATION_BOOST_DURATION, DEFAULT_CIRCULATION_BOOST_DURATION
 from .entity import ViCareEntity
 from .types import (
     HeatingProgram,
@@ -349,9 +350,22 @@ CIRCUIT_ENTITY_DESCRIPTIONS: tuple[ViCareNumberEntityDescription, ...] = (
     ),
 )
 
+CIRCULATION_BOOST_DURATION_DESCRIPTION = ViCareNumberEntityDescription(
+    key="dhw_circulation_boost_duration",
+    translation_key="dhw_circulation_boost_duration",
+    entity_category=EntityCategory.CONFIG,
+    native_min_value=1,
+    native_max_value=60,
+    native_step=1,
+    native_unit_of_measurement=UnitOfTime.MINUTES,
+    value_getter=lambda api: DEFAULT_CIRCULATION_BOOST_DURATION,  # Not used
+    value_setter=None,  # Handled via async_set_native_value
+)
+
 
 def _build_entities(
     device_list: list[ViCareDevice],
+    config_entry: ViCareConfigEntry,
 ) -> list[ViCareNumber]:
     """Create ViCare number entities for a device."""
 
@@ -381,6 +395,21 @@ def _build_entities(
             for description in CIRCUIT_ENTITY_DESCRIPTIONS
             if is_supported(description.key, description.value_getter, circuit)
         )
+        # add circulation boost duration entity (if supported)
+        if is_supported(
+            "dhw_circulation_boost",
+            lambda api: api.getDomesticHotWaterCirculationSchedule(),
+            device.api,
+        ):
+            entities.append(
+                ViCareNumber(
+                    CIRCULATION_BOOST_DURATION_DESCRIPTION,
+                    get_device_serial(device.api),
+                    device.config,
+                    device.api,
+                    config_entry=config_entry,
+                )
+            )
     return entities
 
 
@@ -390,12 +419,12 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Create the ViCare number devices."""
-    async_add_entities(
-        await hass.async_add_executor_job(
-            _build_entities,
-            config_entry.runtime_data.devices,
-        )
+    entities = await hass.async_add_executor_job(
+        _build_entities,
+        config_entry.runtime_data.devices,
+        config_entry,
     )
+    async_add_entities(entities)
 
 
 class ViCareNumber(ViCareEntity, NumberEntity):
@@ -410,23 +439,55 @@ class ViCareNumber(ViCareEntity, NumberEntity):
         device_config: PyViCareDeviceConfig,
         device: PyViCareDevice,
         component: PyViCareHeatingDeviceComponent | None = None,
+        config_entry: ViCareConfigEntry | None = None,
     ) -> None:
         """Initialize the number."""
         super().__init__(
-            description.key, device_serial, device_config, device, component
+            description.key,
+            device_serial,
+            device_config,
+            device,
+            component,
+            config_entry=config_entry,
         )
         self.entity_description = description
 
     @property
+    def native_value(self) -> float | None:
+        """Return the value of the number."""
+        if self.entity_description.key == "dhw_circulation_boost_duration":
+            assert self._config_entry is not None
+            return self._config_entry.options.get(
+                CONF_CIRCULATION_BOOST_DURATION,
+                DEFAULT_CIRCULATION_BOOST_DURATION,
+            )
+        return self._attr_native_value
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Set the value of the number."""
+        if self.entity_description.key == "dhw_circulation_boost_duration":
+            assert self._config_entry is not None
+            self.hass.config_entries.async_update_entry(
+                self._config_entry,
+                options={
+                    **self._config_entry.options,
+                    CONF_CIRCULATION_BOOST_DURATION: int(value),
+                },
+            )
+            self.async_write_ha_state()
+        else:
+            if self.entity_description.value_setter:
+                await self.hass.async_add_executor_job(
+                    self.entity_description.value_setter, self._api, value
+                )
+            self.schedule_update_ha_state(force_refresh=True)
+
+    @property
     def available(self) -> bool:
         """Return True if entity is available."""
+        if self.entity_description.key == "dhw_circulation_boost_duration":
+            return True
         return self._attr_native_value is not None
-
-    def set_native_value(self, value: float) -> None:
-        """Set new value."""
-        if self.entity_description.value_setter:
-            self.entity_description.value_setter(self._api, value)
-        self.schedule_update_ha_state()
 
     def update(self) -> None:
         """Update state of number."""

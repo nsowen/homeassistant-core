@@ -121,6 +121,9 @@
       "comfort_temperature": {
         "name": "Comfort temperature"
       },
+      "dhw_circulation_boost_duration": {
+        "name": "DHW Circulation Boost Duration"
+      },
       "dhw_hysteresis_switch_off": {
         "name": "DHW hysteresis switch off"
       },
@@ -647,6 +650,11 @@
       },
       "zigbee_signal_strength": {
         "name": "[%key:component::sensor::entity_component::signal_strength::name%]"
+      }
+    },
+    "switch": {
+      "dhw_circulation_boost": {
+        "name": "DHW Circulation Boost"
       }
     },
     "water_heater": {
