@@ -1,6 +1,6 @@
 """Test ViCare switch entity."""
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +16,11 @@ from homeassistant.components.vicare.const import (
     DEFAULT_CIRCULATION_BOOST_DURATION,
     DOMAIN,
     WEEKDAYS,
+)
+from homeassistant.components.vicare.switch import (
+    _clean_boost_remnants,
+    _pick_slot_to_remove,
+    _slot_duration_minutes,
 )
 from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON, Platform
 from homeassistant.core import HomeAssistant
@@ -319,3 +324,247 @@ async def test_circulation_boost_restart_recovery(
     state = hass.states.get(ENTITY_SWITCH)
     assert state is not None
     assert state.state == STATE_ON
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for helper functions (req. 7 and 8)
+# ---------------------------------------------------------------------------
+
+
+def test_slot_duration_minutes_normal() -> None:
+    """Test _slot_duration_minutes for a regular slot."""
+    assert _slot_duration_minutes({"start": "06:00", "end": "07:30"}) == 90
+
+
+def test_slot_duration_minutes_ten() -> None:
+    """Test _slot_duration_minutes identifies a 10-minute slot."""
+    assert _slot_duration_minutes({"start": "14:00", "end": "14:10"}) == 10
+
+
+def test_slot_duration_minutes_invalid() -> None:
+    """Test _slot_duration_minutes returns -1 on parse error."""
+    assert _slot_duration_minutes({"start": "bad", "end": "value"}) == -1
+    assert _slot_duration_minutes({}) == -1
+
+
+def test_pick_slot_to_remove_prefers_past() -> None:
+    """Past slot should be preferred over future slots."""
+    slots = [
+        {"start": "06:00", "end": "09:00", "mode": "on", "position": 0},  # past
+        {"start": "18:00", "end": "20:00", "mode": "on", "position": 1},  # future
+    ]
+    # current_time is "15:00" → first slot has ended
+    idx = _pick_slot_to_remove(slots, "15:00")
+    assert idx == 0
+
+
+def test_pick_slot_to_remove_most_recent_past() -> None:
+    """Among multiple past slots, the most recently ended one is chosen."""
+    slots = [
+        {"start": "06:00", "end": "09:00", "mode": "on", "position": 0},
+        {"start": "12:00", "end": "13:00", "mode": "on", "position": 1},  # more recent
+        {"start": "18:00", "end": "20:00", "mode": "on", "position": 2},
+    ]
+    idx = _pick_slot_to_remove(slots, "15:00")
+    assert idx == 1
+
+
+def test_pick_slot_to_remove_falls_back_to_earliest_future() -> None:
+    """When no past slot exists, the earliest-starting future slot is removed."""
+    slots = [
+        {"start": "18:00", "end": "20:00", "mode": "on", "position": 0},
+        {"start": "15:00", "end": "17:00", "mode": "on", "position": 1},  # earliest
+        {"start": "20:00", "end": "22:00", "mode": "on", "position": 2},
+    ]
+    idx = _pick_slot_to_remove(slots, "14:00")
+    assert idx == 1
+
+
+def test_pick_slot_to_remove_empty() -> None:
+    """Empty list should return None."""
+    assert _pick_slot_to_remove([], "12:00") is None
+
+
+def test_clean_boost_remnants_removes_10min_slots() -> None:
+    """_clean_boost_remnants removes exactly-10-minute slots from every day."""
+    schedule = {
+        "mon": [
+            {"start": "06:00", "end": "09:00", "mode": "on", "position": 0},
+            {"start": "14:00", "end": "14:10", "mode": "on", "position": 1},  # remnant
+        ],
+        "tue": [
+            {"start": "08:00", "end": "08:10", "mode": "on", "position": 0},  # remnant
+        ],
+        "wed": [],
+    }
+    result = _clean_boost_remnants(schedule)
+    assert len(result["mon"]) == 1
+    assert result["mon"][0]["start"] == "06:00"
+    assert result["tue"] == []
+    assert result["wed"] == []
+
+
+def test_clean_boost_remnants_keeps_longer_slots() -> None:
+    """_clean_boost_remnants does not remove slots longer than 10 minutes."""
+    schedule = {
+        "mon": [
+            {"start": "06:00", "end": "06:20", "mode": "on", "position": 0},  # 20 min
+            {"start": "12:00", "end": "13:00", "mode": "on", "position": 1},  # 60 min
+        ],
+    }
+    result = _clean_boost_remnants(schedule)
+    assert result["mon"] == schedule["mon"]
+
+
+def test_clean_boost_remnants_passes_through_non_list_values() -> None:
+    """_clean_boost_remnants leaves non-list values (metadata) intact."""
+    schedule: dict = {"active": True, "default_mode": "off", "mon": []}
+    result = _clean_boost_remnants(schedule)
+    assert result["active"] is True
+    assert result["default_mode"] == "off"
+
+
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_circulation_boost_at_max_slots_removes_past_slot(
+    hass: HomeAssistant,
+    vicare_heatpump: MockConfigEntry,
+) -> None:
+    """Test that when today has 4 slots, the most-recently-ended past slot is removed."""
+    now = dt_util.now()
+    today_key = WEEKDAYS[now.weekday()]
+
+    # Build 4 slots: 2 clearly in the past, 2 in the future
+    full_schedule = {
+        **EMPTY_SCHEDULE,
+        today_key: [
+            {"start": "06:00", "end": "07:00", "mode": "on", "position": 0},
+            {"start": "08:00", "end": "09:00", "mode": "on", "position": 1},
+            {"start": "23:00", "end": "23:30", "mode": "on", "position": 2},
+            {"start": "23:30", "end": "23:50", "mode": "on", "position": 3},
+        ],
+    }
+
+    with (
+        patch(
+            "PyViCare.PyViCareHeatingDevice.HeatingDevice.getDomesticHotWaterCirculationSchedule",
+            return_value=full_schedule,
+        ),
+        patch(
+            "PyViCare.PyViCareHeatingDevice.HeatingDevice.setDomesticHotWaterCirculationSchedule",
+        ) as mock_set,
+    ):
+        await hass.services.async_call(
+            SWITCH_DOMAIN,
+            SERVICE_TURN_ON,
+            {ATTR_ENTITY_ID: ENTITY_SWITCH},
+            blocking=True,
+        )
+
+    assert hass.states.get(ENTITY_SWITCH).state == STATE_ON
+    mock_set.assert_called_once()
+    call_args = mock_set.call_args[0][0]
+    # Today must have exactly 4 slots (3 original kept + 1 boost)
+    assert len(call_args[today_key]) == 4
+    # One of the slots must be the boost slot
+    assert any(s["mode"] == "on" for s in call_args[today_key])
+
+
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_circulation_boost_at_max_slots_no_past_removes_earliest(
+    hass: HomeAssistant,
+    vicare_heatpump: MockConfigEntry,
+) -> None:
+    """Test that when all 4 slots are future, the earliest-starting slot is removed."""
+    now = dt_util.now()
+    today_key = WEEKDAYS[now.weekday()]
+
+    # All 4 slots are in the future — run the test at midnight-ish by using
+    # times far ahead; use 22:xx so they are definitely future at test time.
+    full_schedule = {
+        **EMPTY_SCHEDULE,
+        today_key: [
+            {"start": "22:00", "end": "22:30", "mode": "on", "position": 0},
+            {"start": "22:30", "end": "23:00", "mode": "on", "position": 1},
+            {"start": "23:00", "end": "23:30", "mode": "on", "position": 2},
+            {"start": "23:30", "end": "23:50", "mode": "on", "position": 3},
+        ],
+    }
+
+    with (
+        patch(
+            "PyViCare.PyViCareHeatingDevice.HeatingDevice.getDomesticHotWaterCirculationSchedule",
+            return_value=full_schedule,
+        ),
+        patch(
+            "PyViCare.PyViCareHeatingDevice.HeatingDevice.setDomesticHotWaterCirculationSchedule",
+        ) as mock_set,
+        patch("homeassistant.util.dt.now") as mock_now,
+    ):
+        # Set "now" to 21:00 so all above slots are in the future
+        mock_now.return_value = datetime(2024, 1, 15, 21, 0, 0, tzinfo=UTC)
+
+        await hass.services.async_call(
+            SWITCH_DOMAIN,
+            SERVICE_TURN_ON,
+            {ATTR_ENTITY_ID: ENTITY_SWITCH},
+            blocking=True,
+        )
+
+    assert hass.states.get(ENTITY_SWITCH).state == STATE_ON
+    mock_set.assert_called_once()
+    call_args = mock_set.call_args[0][0]
+    today_slots = call_args.get(today_key, [])
+    assert len(today_slots) == 4  # 3 kept + 1 boost
+
+
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_circulation_boost_turn_off_cleans_remnant_slots(
+    hass: HomeAssistant,
+    vicare_heatpump: MockConfigEntry,
+) -> None:
+    """Test that 10-minute remnant boost slots are removed when restoring original schedule."""
+    # The "original" schedule already contains a 10-minute remnant from a previous boost
+    original_with_remnant = {
+        **EMPTY_SCHEDULE,
+        "mon": [
+            {"start": "06:00", "end": "09:00", "mode": "on", "position": 0},
+            {"start": "14:00", "end": "14:10", "mode": "on", "position": 1},  # remnant
+        ],
+        "tue": [
+            {"start": "06:00", "end": "09:00", "mode": "on", "position": 0},
+        ],
+    }
+
+    with (
+        patch(
+            "PyViCare.PyViCareHeatingDevice.HeatingDevice.getDomesticHotWaterCirculationSchedule",
+            return_value=original_with_remnant,
+        ),
+        patch(
+            "PyViCare.PyViCareHeatingDevice.HeatingDevice.setDomesticHotWaterCirculationSchedule",
+        ) as mock_set,
+    ):
+        await hass.services.async_call(
+            SWITCH_DOMAIN,
+            SERVICE_TURN_ON,
+            {ATTR_ENTITY_ID: ENTITY_SWITCH},
+            blocking=True,
+        )
+        assert hass.states.get(ENTITY_SWITCH).state == STATE_ON
+
+        await hass.services.async_call(
+            SWITCH_DOMAIN,
+            SERVICE_TURN_OFF,
+            {ATTR_ENTITY_ID: ENTITY_SWITCH},
+            blocking=True,
+        )
+
+    assert hass.states.get(ENTITY_SWITCH).state == STATE_OFF
+    # The restore call must not include the 10-minute remnant slot
+    restore_args = mock_set.call_args[0][0]
+    for day, slots in restore_args.items():
+        if isinstance(slots, list):
+            for slot in slots:
+                assert _slot_duration_minutes(slot) != 10, (
+                    f"Remnant 10-min slot found in day {day}: {slot}"
+                )

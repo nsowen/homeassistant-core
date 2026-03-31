@@ -32,6 +32,55 @@ from .utils import get_device_serial, is_supported
 _LOGGER = logging.getLogger(__name__)
 
 PARALLEL_UPDATES = 0
+MAX_SLOTS_PER_DAY = 4
+
+
+def _pick_slot_to_remove(slots: list[dict[str, Any]], current_time: str) -> int | None:
+    """Return the index of the best slot to temporarily remove to free capacity.
+
+    Prefers the most recently ended past slot (end <= current_time).
+    Falls back to the slot with the earliest start time if none have passed.
+    Returns None only when the list is empty.
+    """
+    if not slots:
+        return None
+    past = [(i, s) for i, s in enumerate(slots) if s.get("end", "") <= current_time]
+    if past:
+        return max(past, key=lambda t: t[1].get("end", ""))[0]
+    return min(range(len(slots)), key=lambda i: slots[i].get("start", ""))
+
+
+def _slot_duration_minutes(slot: dict[str, Any]) -> int:
+    """Return the duration of a schedule slot in minutes, or -1 on parse error."""
+    try:
+        start_h, start_m = map(int, slot["start"].split(":"))
+        end_h, end_m = map(int, slot["end"].split(":"))
+        return (end_h * 60 + end_m) - (start_h * 60 + start_m)
+    except KeyError, ValueError:
+        return -1
+
+
+def _clean_boost_remnants(schedule: dict[str, Any]) -> dict[str, Any]:
+    """Remove 10-minute remnant boost slots from every day in the schedule.
+
+    A 10-minute slot is the minimum possible boost artifact (start rounded down
+    to 10-minute grid, end rounded up for a sub-10-minute requested duration).
+    These can accumulate if HA restarts during a boost before cleanup runs.
+    """
+    cleaned: dict[str, Any] = {}
+    for day, slots in schedule.items():
+        if isinstance(slots, list):
+            kept = [s for s in slots if _slot_duration_minutes(s) != 10]
+            if len(kept) != len(slots):
+                _LOGGER.debug(
+                    "Removed %d remnant boost slot(s) from %s during schedule restore",
+                    len(slots) - len(kept),
+                    day,
+                )
+            cleaned[day] = kept
+        else:
+            cleaned[day] = slots
+    return cleaned
 
 
 @dataclass(frozen=True)
@@ -179,12 +228,17 @@ class ViCareCirculationBoostSwitch(ViCareEntity, SwitchEntity):
         self.hass.config_entries.async_update_entry(self._config_entry, options=options)
 
     async def _restore_original_schedule(self) -> None:
-        """Restore the original circulation schedule."""
+        """Restore the original circulation schedule.
+
+        Also removes any 10-minute remnant boost slots that may have
+        accumulated in the schedule during previous restarts.
+        """
         assert self._config_entry is not None
         original = self._config_entry.options.get(CONF_BOOST_ORIGINAL_SCHEDULE)
         if original is not None:
             try:
                 restore = {day: original[day] for day in WEEKDAYS if day in original}
+                restore = _clean_boost_remnants(restore)
                 await self.hass.async_add_executor_job(
                     self._api.setDomesticHotWaterCirculationSchedule,
                     restore,
@@ -208,9 +262,31 @@ class ViCareCirculationBoostSwitch(ViCareEntity, SwitchEntity):
             end_time = self._ceil_to_10min(boost_end_dt)
             today_weekday = WEEKDAYS[now.weekday()]
 
-            # Check for conflicts with existing slots
-            existing_slots = original_schedule.get(today_weekday, [])
-            for slot in existing_slots:
+            # Deep-copy today's slots so we can mutate freely without
+            # touching the saved _original_schedule.
+            working_slots = [dict(s) for s in original_schedule.get(today_weekday, [])]
+
+            # Capacity management: the API allows at most MAX_SLOTS_PER_DAY
+            # entries per day.  If we are already at the limit, temporarily
+            # remove the best candidate (most-recently-ended past slot, or
+            # the earliest upcoming slot) to make room for the boost.
+            if len(working_slots) >= MAX_SLOTS_PER_DAY:
+                remove_idx = _pick_slot_to_remove(working_slots, start_time)
+                if remove_idx is None:
+                    _LOGGER.warning(
+                        "Cannot add circulation boost: schedule is full for %s",
+                        today_weekday,
+                    )
+                    return
+                removed = working_slots.pop(remove_idx)
+                _LOGGER.debug(
+                    "Temporarily removed slot %s–%s to make room for boost",
+                    removed.get("start"),
+                    removed.get("end"),
+                )
+
+            # Check for conflicts with the remaining slots.
+            for slot in working_slots:
                 slot_start = slot.get("start", "")
                 slot_end = slot.get("end", "")
                 if (
@@ -232,16 +308,14 @@ class ViCareCirculationBoostSwitch(ViCareEntity, SwitchEntity):
                 "mode": "on",
                 "position": 0,
             }
-            # Deep-copy slots so we don't mutate the saved original_schedule,
-            # then prepend the boost slot and reassign positions sequentially.
-            today_slots = [dict(s) for s in existing_slots]
-            today_slots.insert(0, boost_slot)
-            for i, slot in enumerate(today_slots):
+            # Prepend boost slot and reassign positions sequentially.
+            working_slots.insert(0, boost_slot)
+            for i, slot in enumerate(working_slots):
                 slot["position"] = i
             # The setSchedule command only accepts day entries — strip metadata fields.
             new_schedule = {
                 day: (
-                    today_slots
+                    working_slots
                     if day == today_weekday
                     else list(original_schedule[day])
                 )
@@ -297,6 +371,7 @@ class ViCareCirculationBoostSwitch(ViCareEntity, SwitchEntity):
                     for day in WEEKDAYS
                     if day in self._original_schedule
                 }
+                restore = _clean_boost_remnants(restore)
                 await self.hass.async_add_executor_job(
                     self._api.setDomesticHotWaterCirculationSchedule,
                     restore,
